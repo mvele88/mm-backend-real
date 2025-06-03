@@ -1,0 +1,472 @@
+const express = require('express');
+const { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, Transaction, SystemProgram, sendAndConfirmTransaction } = require('@solana/web3.js');
+const axios = require('axios');
+const bs58 = require('bs58');
+const cors = require('cors');
+
+const app = express();
+app.use(express.json());
+
+// --- START CORS CONFIGURATION ---
+const allowedOrigins = [
+  'https://mm-frontend-lemon.vercel.app',
+  'https://ipfs.io',
+  'https://ipfs.io/ipfs/QmcNQAg9aBGBJjEn2xRpsRzSX1EVRUyNqErANVfHTUwfPN/',
+];
+
+const corsOptions = {
+  origin: function (origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      const msg = 'The CORS policy for this site does not allow access from the specified Origin.';
+      callback(new Error(msg), false);
+    }
+  },
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
+  optionsSuccessStatus: 200
+};
+
+app.use(cors(corsOptions));
+// --- END CORS CONFIGURATION ---
+
+let isRunning = false;
+let profitUSD = 0;
+let startTime = null;
+let transactionMonitorInterval = null;
+
+// Solana Configuration
+const SOLANA_RPC_URL = 'https://fittest-patient-pond.solana-mainnet.quiknode.pro/de9d37470b2873fedf650c074df9c9aa8519f5d9/';
+const connection = new Connection(SOLANA_RPC_URL, 'confirmed');
+
+// Internal Wallet Keypair (loaded securely from env)
+let internalWalletKeypair;
+
+// Environment Variables (MUST be set in .env or Vercel settings)
+const PLATFORM_SOLANA_ADDRESS = process.env.PLATFORM_SOLANA_ADDRESS;
+const PLATFORM_SOLANA_PUBLIC_KEY = PLATFORM_SOLANA_ADDRESS ? new PublicKey(PLATFORM_SOLANA_ADDRESS) : null;
+const BLOCKONOMICS_API_KEY = process.env.BLOCKONOMICS_API_KEY;
+// NEW: Jupiter API Key
+const JUPITER_API_KEY = process.env.JUPITER_API_KEY; // Ensure this is set in your Vercel Environment Variables
+
+// Jupiter Aggregator Program ID (for identifying transactions, not direct API calls)
+const JUPITER_AGGREGATOR_PROGRAM_ID = new PublicKey('JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB');
+
+// Developer BTC Addresses (The 20% share will go to DEV_BTC_ADDRESSES[0])
+const DEV_BTC_ADDRESSES = [
+    'bc1q9k79mkx82h8e8awvda5slgw9sku0lyrf5mlaek', // This will be the 20% dev share
+    'bc1ql37nntg829w2vyufpheg9wxdutl8m4zjvjudt2' // Keeping this here but not used in the 20% split
+];
+
+// Loss Protection Thresholds
+const MIN_PROFIT_THRESHOLD_USD = 0.20;
+const MAX_PRICE_IMPACT_PCT = 0.005;
+
+// --- CoinGecko Price Caching ---
+let cachedSolUsdPrice = 0;
+let lastPriceFetchTime = 0;
+const PRICE_CACHE_DURATION = 5 * 60 * 1000;
+
+// --- Helper Functions ---
+
+async function getSolUsdPrice() {
+    if (Date.now() - lastPriceFetchTime < PRICE_CACHE_DURATION && cachedSolUsdPrice !== 0) {
+        console.log('[PRICE_CACHE] Using cached SOL/USD price.');
+        return cachedSolUsdPrice;
+    }
+    try {
+        console.log('[PRICE_CACHE] Fetching new SOL/USD price from CoinGecko...');
+        const response = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
+        if (response.data && response.data.solana && response.data.solana.usd) {
+            cachedSolUsdPrice = response.data.solana.usd;
+            lastPriceFetchTime = Date.now();
+            console.log(`[PRICE_CACHE] Fetched new SOL/USD price: ${cachedSolUsdPrice}`);
+            return cachedSolUsdPrice;
+        }
+    } catch (error) {
+        console.error('Error fetching SOL/USD price from CoinGecko:', error.message);
+    }
+    return 0;
+}
+
+// Function to get Jupiter Quote with new endpoint and API Key
+async function getJupiterQuote(inputMint, outputMint, amount, slippage = 2, onlyDirectRoutes = false) {
+    if (!JUPITER_API_KEY) {
+        console.error("[JUPITER_QUOTE] JUPITER_API_KEY is not set. Cannot fetch quote.");
+        return null;
+    }
+    try {
+        console.log(`[JUPITER_QUOTE] Requesting quote: InputMint=${inputMint}, OutputMint=${outputMint}, Amount=${amount}, Slippage=${slippage}, OnlyDirectRoutes=${onlyDirectRoutes}`);
+        const response = await axios.get('https://api.jup.ag/swap/v1/quote', { // *** REPLACE THIS URL WITH YOUR ACTUAL PAID JUPITER QUOTE ENDPOINT ***
+            params: {
+                inputMint,
+                outputMint,
+                amount,
+                slippage,
+                onlyDirectRoutes
+            },
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${JUPITER_API_KEY}` // *** CONFIRM HEADER NAME ('Authorization', 'X-API-KEY', etc.) AND FORMAT ('Bearer ', etc.) WITH JUPITER DOCS ***
+            },
+            timeout: 30000 // 30 seconds timeout - Keep this.
+        });
+        return response.data;
+    } catch (error) {
+        if (axios.isAxiosError(error)) {
+            if (error.code === 'ECONNABORTED') {
+                console.error(`Error fetching Jupiter quote (TIMEOUT): timeout of ${error.config.timeout}ms exceeded`);
+            } else if (error.response) {
+                console.error(`Error fetching Jupiter quote (HTTP ${error.response.status}):`,
+                                `Message: ${error.message}, Data:`, error.response.data);
+            } else {
+                console.error(`Error fetching Jupiter quote (Network/Unknown):`, error.message);
+            }
+        } else {
+            console.error(`Unexpected Error fetching Jupiter quote:`, error);
+        }
+        return null;
+    }
+}
+
+const sendBTC = async (btcAddress, usdAmount) => {
+    if (!BLOCKONOMICS_API_KEY) {
+        console.error("BLOCKONOMICS_API_KEY is not set. BTC payment skipped for", btcAddress);
+        return { status: 'failed', message: 'Blockonomics API key missing.' };
+    }
+    try {
+        const response = await axios.post('https://www.blockonomics.co/api/merchant_order', {
+            addr: btcAddress,
+            value: usdAmount * 100, // Blockonomics expects value in cents
+        }, {
+            headers: {
+                'Authorization': `Bearer ${BLOCKONOMICS_API_KEY}`,
+                'Content-Type': 'application/json'
+            }
+        });
+        console.log(`BTC payment to ${btcAddress} successful. Blockonomics Order ID: ${response.data.order_id}`);
+        return { status: 'success', orderId: response.data.order_id };
+    } catch (error) {
+        console.error(`Error sending BTC payment to ${btcAddress}:`, error.response ? error.response.data : error.message);
+        return { status: 'failed', message: error.response ? error.response.data : error.message };
+    }
+};
+
+// --- Main Profit Calculation and Sniping Logic ---
+async function calculateRealProfit() {
+    console.log('[BOT_CYCLE] Starting new profit calculation cycle...');
+    if (!isRunning) {
+        console.log('[BOT_CYCLE] Bot is not running, skipping cycle.');
+        return;
+    }
+    if (!internalWalletKeypair || !PLATFORM_SOLANA_PUBLIC_KEY) {
+        console.error("Internal wallet or PLATFORM_SOLANA_ADDRESS not loaded. Cannot execute swaps.");
+        return;
+    }
+    if (!JUPITER_API_KEY) { // Check for API key before attempting Jupiter calls
+        console.error("JUPITER_API_KEY is not set. Cannot search for profitable swaps.");
+        return;
+    }
+
+    console.log('Searching for and executing profitable Jupiter swaps...');
+    const solUsdPrice = await getSolUsdPrice();
+    if (solUsdPrice === 0) {
+        console.warn('Could not fetch SOL/USD price. Skipping swap evaluation for this cycle.');
+        return;
+    }
+
+    const inputAmountForTrade = 0.1; // Reverted to 0.1 SOL
+    const inputLamportsForTrade = Math.round(inputAmountForTrade * LAMPORTS_PER_SOL);
+    const inputMintTrade = 'So11111111111111111111111111111111111111112'; // SOL Mint address
+    const outputMintTrade = 'EPjFWdd5AufqSSqeM2qN1xzybapT8G4wEGGkZwyTDt1v'; // USDC Mint address
+
+    const quoteRes = await getJupiterQuote(inputMintTrade, outputMintTrade, inputLamportsForTrade);
+
+    if (quoteRes && quoteRes.data && quoteRes.data.length > 0) {
+        const bestRoute = quoteRes.data[0];
+
+        if (bestRoute.priceImpactPct > MAX_PRICE_IMPACT_PCT) {
+            console.log(`Skipping trade due to high price impact: ${bestRoute.priceImpactPct.toFixed(4)}`);
+            return;
+        }
+
+        try {
+            console.log(`[SWAP_EXEC] Attempting swap for route: ${bestRoute.id}`);
+            const swapRes = await axios.post('https://api.jup.ag/swap/v1/swap', { // *** REPLACE THIS URL WITH YOUR ACTUAL PAID JUPITER SWAP ENDPOINT ***
+                route: bestRoute,
+                userPublicKey: PLATFORM_SOLANA_PUBLIC_KEY.toBase58(),
+                wrapUnwrapSOL: true,
+                feeAccount: null,
+            }, {
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${JUPITER_API_KEY}` // *** CONFIRM HEADER NAME AND FORMAT WITH JUPITER DOCS ***
+                }
+            });
+
+            const { swapTransaction } = swapRes.data;
+
+            const transaction = Transaction.from(Buffer.from(swapTransaction, 'base64'));
+            transaction.sign(internalWalletKeypair);
+
+            const txid = await connection.sendRawTransaction(transaction.serialize());
+            console.log(`Swap transaction sent. TxID: ${txid}`);
+
+            await connection.confirmTransaction(txid, 'confirmed');
+            console.log(`Swap transaction confirmed: ${txid}`);
+
+            const parsedTx = await connection.getParsedTransaction(txid, {
+                commitment: 'confirmed',
+                maxSupportedTransactionVersion: 0
+            });
+
+            if (parsedTx && !parsedTx.meta.err) {
+                let actualReceivedAmountUi = 0;
+                let inputAmountUi = bestRoute.inAmount / (10 ** bestRoute.inToken.decimals);
+                let feesPaidSol = parsedTx.meta.fee / LAMPORTS_PER_SOL;
+
+                const postTokenBalances = parsedTx.meta.postTokenBalances;
+                const preTokenBalances = parsedTx.meta.preTokenBalances;
+
+                const outputMintPublicKey = new PublicKey(outputMintTrade);
+                const internalWalletPublicKeyString = PLATFORM_SOLANA_PUBLIC_KEY.toBase58();
+
+                const postBalanceEntry = postTokenBalances.find(bal =>
+                    bal.owner === internalWalletPublicKeyString && bal.mint === outputMintPublicKey.toBase58()
+                );
+                const preBalanceEntry = preTokenBalances.find(bal =>
+                    bal.owner === internalWalletPublicKeyString && bal.mint === outputMintPublicKey.toBase58()
+                );
+
+                if (postBalanceEntry && preBalanceEntry) {
+                    const postAmount = postBalanceEntry.uiTokenAmount.uiAmount;
+                    const preAmount = preBalanceEntry.uiTokenAmount.uiAmount;
+                    actualReceivedAmountUi = postAmount - preAmount;
+                } else {
+                    console.warn(`Could not precisely parse actual output token amount for ${outputMintTrade}. Using bestRoute.outAmount as fallback.`);
+                    actualReceivedAmountUi = bestRoute.outAmount / (10 ** bestRoute.outToken.decimals);
+                }
+
+                // Assuming we are always trading SOL for USDC (or another token) and then want to measure profit in USD
+                let outputTokenUsdValue = 0;
+                if (outputMintTrade === 'EPjFWdd5AufqSSqeM2qN1xzybapT8G4wEGGkZwyTDt1v') { // If output is USDC
+                    outputTokenUsdValue = actualReceivedAmountUi * 1; // Assuming USDC is ~$1
+                } else if (outputMintTrade === 'So11111111111111111111111111111111111111112') { // If output is SOL
+                    outputTokenUsdValue = actualReceivedAmountUi * solUsdPrice;
+                }
+                // For other tokens, you'd need to fetch their USD price. For simplicity, keeping it as USDC or SOL.
+
+
+                const inputCostUSD = inputAmountUi * solUsdPrice;
+                const feesPaidUSD = feesPaidSol * solUsdPrice;
+
+                // Profit is (Value of output token - Cost of input token - Fees paid) in USD
+                const finalNetUSDProfit = outputTokenUsdValue - inputCostUSD - feesPaidUSD;
+
+
+                if (finalNetUSDProfit >= MIN_PROFIT_THRESHOLD_USD) {
+                    profitUSD += finalNetUSDProfit;
+                    console.log(`✅ Realized PROFIT: $${finalNetUSDProfit.toFixed(2)} USD from TxID: ${txid}`);
+                    console.log(`Current Total Profit: $${profitUSD.toFixed(2)} USD.`);
+                } else {
+                    console.log(`❌ Trade resulted in low/negative profit ($${finalNetUSDProfit.toFixed(2)} USD). TxID: ${txid}`);
+                }
+
+            } else {
+                console.error(`Transaction ${txid} failed or could not be parsed:`, parsedTx.meta.err);
+            }
+
+        } catch (swapError) {
+            console.error('Error during Jupiter swap execution or confirmation:', swapError);
+        }
+    } else {
+        console.log('No profitable Jupiter route found for current trade check.');
+    }
+}
+
+
+// --- API Endpoints ---
+
+app.post('/start', async (req, res) => {
+    console.log("[API /start] Received /start request.");
+    if (!isRunning) {
+        isRunning = true;
+        startTime = Date.now();
+        console.log("[API /start] Setting isRunning to TRUE. Bot startup sequence initiated.");
+
+        if (!PLATFORM_SOLANA_PUBLIC_KEY) {
+            isRunning = false;
+            console.error("[API /start] ERROR: PLATFORM_SOLANA_ADDRESS environment variable not set. Cannot start.");
+            return res.status(500).json({ message: "PLATFORM_SOLANA_ADDRESS environment variable not set." });
+        }
+        try {
+            console.log("[API /start] Attempting to load SOLANA_PRIVATE_KEY_BASE58...");
+            const privateKeyBase58 = process.env.SOLANA_PRIVATE_KEY_BASE58;
+            if (!privateKeyBase58) {
+                throw new Error("SOLANA_PRIVATE_KEY_BASE58 environment variable not set. Cannot start sniping.");
+            }
+            internalWalletKeypair = Keypair.fromSecretKey(bs58.decode(privateKeyBase58));
+            console.log(`[API /start] Internal wallet loaded successfully: ${internalWalletKeypair.publicKey.toBase58()}`);
+        } catch (error) {
+            console.error("[API /start] ERROR: Failed to load internal wallet:", error.message);
+            isRunning = false;
+            return res.status(500).json({ message: `Failed to start: ${error.message}` });
+        }
+
+        if (transactionMonitorInterval) clearInterval(transactionMonitorInterval);
+        // Reset interval to 30 seconds
+        transactionMonitorInterval = setInterval(calculateRealProfit, 30 * 1000); // Reset to 30 seconds
+        console.log("[API /start] Sniping process interval started. Next cycle in 30 seconds.");
+        res.json({ message: "Sniping started. Monitoring for profitable trades and executing swaps." });
+    } else {
+        console.log("[API /start] Sniping already running. Ignoring request.");
+        res.json({ message: "Already running." });
+    }
+});
+
+app.post('/stop', (req, res) => {
+    isRunning = false;
+    if (transactionMonitorInterval) clearInterval(transactionMonitorInterval);
+    console.log("Sniping stopped.");
+    res.json({ message: "Sniping stopped." });
+});
+
+app.get('/status', async (req, res) => {
+    const uptimeHours = isRunning ? ((Date.now() - startTime) / 3600000).toFixed(2) : 0;
+    const solUsd = await getSolUsdPrice();
+    res.json({
+        running: isRunning,
+        profitUSD: profitUSD.toFixed(2),
+        uptimeHours,
+        solUsdPrice: solUsd
+    });
+});
+
+app.get('/test-blockonomics-api', async (req, res) => {
+    console.log('[API /test-blockonomics-api] Testing Blockonomics API Key...');
+    if (!BLOCKONOMICS_API_KEY) {
+        console.error('[API /test-blockonomics-api] BLOCKONOMICS_API_KEY is not set.');
+        return res.status(500).json({ status: 'error', message: 'BLOCKONOMICS_API_KEY environment variable not set.' });
+    }
+
+    try {
+        const response = await axios.get('https://www.blockonomics.co/api/merchant_info', {
+            headers: {
+                'Authorization': `Bearer ${BLOCKONOMICS_API_KEY}`,
+                'Content-Type': 'application/json'
+            },
+            timeout: 15000
+        });
+
+        console.log('[API /test-blockonomics-api] Blockonomics API Key TEST SUCCESS. Response data:', response.data);
+        res.json({
+            status: 'success',
+            message: 'Blockonomics API key is valid.',
+            merchantInfo: response.data
+        });
+    } catch (error) {
+        console.error('[API /test-blockonomics-api] Blockonomics API Key TEST FAILED. Error:', error.response ? error.response.data : error.message);
+        let errorMessage = 'Failed to verify Blockonomics API key.';
+        if (axios.isAxiosError(error) && error.response) {
+            if (error.response.status === 401) {
+                errorMessage = 'Blockonomics API key is invalid or unauthorized.';
+            } else {
+                errorMessage = `Blockonomics API error: ${error.response.status} - ${JSON.stringify(error.response.data)}`;
+            }
+        } else if (axios.isAxiosError(error) && error.code === 'ECONNABORTED') {
+            errorMessage = 'Blockonomics API key test timed out.';
+        } else {
+            errorMessage = `Network error or unexpected error: ${error.message}`;
+        }
+        res.status(error.response ? error.response.status : 500).json({
+            status: 'error',
+            message: errorMessage
+        });
+    }
+});
+
+
+app.post('/withdraw', async (req, res) => {
+    // We are no longer expecting userWalletAddress in the body as all payouts are BTC to dev wallets.
+    // The previous logic for handling userWalletAddress and SOL transfers has been removed.
+
+    const primaryDevBtcAddress = 'bc1q3h4murmcasrgxresm5cmgchxl3zk66ukxzjn93'; // 80% share BTC address
+    const secondaryDevBtcAddress = DEV_BTC_ADDRESSES[0]; // 20% share BTC address, from the predefined array
+
+    const total = profitUSD;
+    if (total <= 0) {
+        return res.json({ status: 'failed', message: 'No profit to withdraw.' });
+    }
+
+    // Since withdrawals are now exclusively in BTC via Blockonomics,
+    // the internalWalletKeypair and Solana connection are not needed for this endpoint.
+
+    const primaryDevShareUSD = total * 0.8;
+    const secondaryDevShareUSD = total * 0.2;
+
+    try {
+        // No need to fetch SOL/USD price as we are directly dealing with USD-denominated BTC payments.
+
+        // Send 80% BTC to the primary dev address
+        const primaryDevBtcPaymentResult = await sendBTC(primaryDevBtcAddress, primaryDevShareUSD);
+        console.log(`Sent ${primaryDevShareUSD.toFixed(2)} USD in BTC to primary dev address: ${primaryDevBtcAddress}. Status: ${primaryDevBtcPaymentResult.status}`);
+
+        // Send 20% BTC to the secondary dev address
+        const secondaryDevBtcPaymentResult = await sendBTC(secondaryDevBtcAddress, secondaryDevShareUSD);
+        console.log(`Sent ${secondaryDevShareUSD.toFixed(2)} USD in BTC to secondary dev address: ${secondaryDevBtcAddress}. Status: ${secondaryDevBtcPaymentResult.status}`);
+
+        let withdrawalStatus = 'All BTC payments initiated.';
+        let errors = [];
+
+        if (primaryDevBtcPaymentResult.status === 'failed') {
+            errors.push(`Failed to send 80% BTC to ${primaryDevBtcAddress}: ${primaryDevBtcPaymentResult.message}`);
+        }
+        if (secondaryDevBtcPaymentResult.status === 'failed') {
+            errors.push(`Failed to send 20% BTC to ${secondaryDevBtcAddress}: ${secondaryDevBtcPaymentResult.message}`);
+        }
+
+        if (errors.length > 0) {
+            withdrawalStatus = 'Warning: Some BTC payments failed. Check logs.';
+            // Do not reset profitUSD if payments failed, to allow retry
+            res.status(500).json({
+                status: 'failed',
+                message: `Withdrawal partially failed. ${withdrawalStatus}`,
+                primaryDevBtcPayment: primaryDevBtcPaymentResult,
+                secondaryDevBtcPayment: secondaryDevBtcPaymentResult,
+                errors: errors
+            });
+            return;
+        }
+
+        profitUSD = 0; // Reset profit if all payments were successful
+        res.json({
+            status: 'success',
+            message: `Withdrawal complete. ${primaryDevShareUSD.toFixed(2)} USD sent to ${primaryDevBtcAddress} and ${secondaryDevShareUSD.toFixed(2)} USD sent to ${secondaryDevBtcAddress}.`,
+            primaryDevBtcPayment: primaryDevBtcPaymentResult,
+            secondaryDevBtcPayment: secondaryDevBtcPaymentResult
+        });
+
+    } catch (error) {
+        console.error('Withdrawal error:', error);
+        res.status(500).json({ status: 'failed', message: `Withdrawal failed: ${error.message}` });
+    }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`Backend running on port ${PORT}`);
+    if (!process.env.SOLANA_PRIVATE_KEY_BASE58) {
+        console.warn("WARNING: SOLANA_PRIVATE_KEY_BASE58 is not set. Sniping will fail.");
+    }
+    if (!process.env.BLOCKONOMICS_API_KEY) {
+        console.warn("WARNING: BLOCKONOMICS_API_KEY is not set. BTC payments will fail.");
+    }
+    if (!PLATFORM_SOLANA_ADDRESS) {
+        console.warn("WARNING: PLATFORM_SOLANA_ADDRESS is not set. Sniping will not properly identify your wallet.");
+    }
+    if (!JUPITER_API_KEY) {
+        console.warn("WARNING: JUPITER_API_KEY is not set. Jupiter API calls will fail or be rate-limited.");
+    }
+});
