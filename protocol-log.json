@@ -1,0 +1,12 @@
+{
+  "month": 0,
+  "profit": 0,
+  "reinvest": 0,
+  "take_home": 0,
+  "date": null,
+  "txs": {
+    "sol": null,
+    "btc_80": null,
+    "btc_20": null
+  }
+}
